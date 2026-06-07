@@ -1,0 +1,20 @@
+name: distributed-cache
+
+services:
+  node-a:
+    environment:
+      CACHE_REPLICATION_FACTOR: "1"
+      CACHE_RAFT: "false"
+      CACHE_PEERS: node-b=node-b:6379,node-c=node-c:6379
+
+  node-b:
+    environment:
+      CACHE_REPLICATION_FACTOR: "1"
+      CACHE_RAFT: "false"
+      CACHE_PEERS: node-a=node-a:6379,node-c=node-c:6379
+
+  node-c:
+    environment:
+      CACHE_REPLICATION_FACTOR: "1"
+      CACHE_RAFT: "false"
+      CACHE_PEERS: node-a=node-a:6379,node-b=node-b:6379

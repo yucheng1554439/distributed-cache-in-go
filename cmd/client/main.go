@@ -22,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s [-addr host:port] [-ttl duration] <SET|GET|DEL|OWNER|CLUSTER_MEMBERS|CLUSTER_JOIN|CLUSTER_LEAVE> [args...]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: %s [-addr host:port] [-ttl duration] <SET|GET|DEL|OWNER|CLUSTER_MEMBERS|CLUSTER_JOIN|CLUSTER_LEAVE|RAFT_STATUS> [args...]\n", os.Args[0])
 		os.Exit(2)
 	}
 
@@ -49,12 +49,27 @@ func main() {
 			}
 			targetAddr = resp.Addr
 			continue
+		case protocol.ResponseNotLeader:
+			if redirects == maxRedirects {
+				fmt.Fprintf(os.Stderr, "too many redirects\n")
+				os.Exit(1)
+			}
+			if resp.Addr != "" {
+				targetAddr = resp.Addr
+			}
+			continue
 		case protocol.ResponseOK:
 			fmt.Println("OK")
 		case protocol.ResponseNotFound:
 			fmt.Println("NOT_FOUND")
 		case protocol.ResponseValue:
-			fmt.Printf("VALUE %s\n", string(resp.Value))
+			if command == protocol.CommandRaftStatus {
+				fmt.Printf("RAFT_STATUS %s\n", string(resp.Value))
+			} else if command == protocol.CommandMetrics {
+				fmt.Printf("METRICS %s\n", string(resp.Value))
+			} else {
+				fmt.Printf("VALUE %s\n", string(resp.Value))
+			}
 		case protocol.ResponseOwner:
 			fmt.Printf("OWNER %s %s\n", resp.NodeID, resp.Addr)
 		case protocol.ResponseMembers:
@@ -91,6 +106,14 @@ func buildRequest(command string, args []string, ttl time.Duration) (protocol.Re
 	case protocol.CommandClusterMembers:
 		if len(args) != 0 {
 			return protocol.Request{}, fmt.Errorf("CLUSTER_MEMBERS accepts no arguments")
+		}
+	case protocol.CommandMetrics:
+		if len(args) != 0 {
+			return protocol.Request{}, fmt.Errorf("METRICS accepts no arguments")
+		}
+	case protocol.CommandRaftStatus:
+		if len(args) != 0 {
+			return protocol.Request{}, fmt.Errorf("RAFT_STATUS accepts no arguments")
 		}
 	case protocol.CommandClusterJoin:
 		if len(args) != 2 {

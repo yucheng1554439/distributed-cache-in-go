@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +14,10 @@ import (
 
 	"github.com/distributed-cache/distributed-cache/internal/cache"
 	"github.com/distributed-cache/distributed-cache/internal/cluster"
+	"github.com/distributed-cache/distributed-cache/internal/metrics"
 	"github.com/distributed-cache/distributed-cache/internal/protocol"
+	"github.com/distributed-cache/distributed-cache/internal/replication"
+	"github.com/distributed-cache/distributed-cache/internal/raft"
 )
 
 const defaultMaxConnections = 1024
@@ -27,6 +31,9 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	Logger          *slog.Logger
 	Cluster         *cluster.Cluster
+	Replication     *replication.Manager
+	Raft            *raft.Node
+	Metrics         *metrics.Registry
 }
 
 // Server serves cache commands over TCP.
@@ -132,6 +139,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
 	remote := conn.RemoteAddr().String()
+	s.trace(remote, "connection_accepted", "")
 	s.cfg.Logger.Info("client connected", "remote", remote)
 	defer s.cfg.Logger.Info("client disconnected", "remote", remote)
 
@@ -144,6 +152,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			_ = conn.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout))
 		}
 
+		s.trace(remote, "request_decode_start", "")
 		req, err := protocol.DecodeRequest(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -153,67 +162,226 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 				s.cfg.Logger.Warn("read timeout", "remote", remote)
 				return
 			}
+			s.trace(remote, "response_encoded", "decode_error")
 			s.writeResponse(conn, protocol.Response{
 				Kind:    protocol.ResponseError,
 				Message: err.Error(),
 			})
+			s.trace(remote, "response_flushed", "decode_error")
 			return
 		}
+		s.trace(remote, "request_decoded", req.Command)
 
-		resp := s.dispatch(req)
+		start := time.Now()
+		s.trace(remote, "dispatch_start", req.Command)
+		reqCtx := ctx
+		if s.cfg.ReadTimeout > 0 {
+			var cancel context.CancelFunc
+			reqCtx, cancel = context.WithTimeout(ctx, s.cfg.ReadTimeout)
+			defer cancel()
+		}
+		resp := s.dispatch(reqCtx, req)
+		s.trace(remote, "dispatch_complete", req.Command)
+		if s.cfg.Metrics != nil {
+			s.cfg.Metrics.Observe(req.Command, time.Since(start), resp.Kind == protocol.ResponseError)
+		}
+		s.trace(remote, "response_encoded", req.Command)
 		if err := s.writeResponse(conn, resp); err != nil {
 			s.cfg.Logger.Warn("write failed", "remote", remote, "error", err)
 			return
 		}
+		s.trace(remote, "response_flushed", req.Command)
 	}
 }
 
-func (s *Server) dispatch(req protocol.Request) protocol.Response {
+func (s *Server) dispatch(ctx context.Context, req protocol.Request) protocol.Response {
 	switch req.Command {
+	case protocol.CommandPing:
+		s.trace("", "handler_entered", protocol.CommandPing)
+		return protocol.Response{Kind: protocol.ResponseOK}
+	case protocol.CommandMetrics:
+		s.trace("", "handler_entered", protocol.CommandMetrics)
+		return s.dispatchMetrics()
+	case protocol.CommandRaftRequestVote:
+		s.trace("", "handler_entered", protocol.CommandRaftRequestVote)
+		return s.dispatchRaftRequestVote(req.Value)
+	case protocol.CommandRaftAppendEntries:
+		s.trace("", "handler_entered", protocol.CommandRaftAppendEntries)
+		return s.dispatchRaftAppendEntries(req.Value)
+	case protocol.CommandRaftStatus:
+		s.trace("", "handler_entered", protocol.CommandRaftStatus)
+		return s.dispatchRaftStatus()
+	case protocol.CommandReplSet:
+		s.trace("", "handler_entered", protocol.CommandReplSet)
+		return s.dispatchReplicaSet(req)
+	case protocol.CommandReplDelete:
+		s.trace("", "handler_entered", protocol.CommandReplDelete)
+		return s.dispatchReplicaDelete(req.Key)
+	case protocol.CommandReplGet:
+		s.trace("", "handler_entered", protocol.CommandReplGet)
+		return s.dispatchReplicaGet(req.Key)
 	case protocol.CommandOwner:
+		s.trace("", "handler_entered", protocol.CommandOwner)
 		return s.dispatchOwner(req.Key)
 	case protocol.CommandClusterMembers:
+		s.trace("", "handler_entered", protocol.CommandClusterMembers)
 		return s.dispatchClusterMembers()
 	case protocol.CommandClusterJoin:
+		s.trace("", "handler_entered", protocol.CommandClusterJoin)
 		return s.dispatchClusterJoin(req.Key, string(req.Value))
 	case protocol.CommandClusterLeave:
+		s.trace("", "handler_entered", protocol.CommandClusterLeave)
 		return s.dispatchClusterLeave(req.Key)
-	case protocol.CommandSet, protocol.CommandGet, protocol.CommandDelete:
-		if resp, ok := s.checkOwnership(req.Key); !ok {
+	case protocol.CommandSet:
+		s.trace("", "handler_entered", protocol.CommandSet)
+		if resp, ok := s.checkWriteRouting(req.Key); !ok {
 			return resp
 		}
+		return s.dispatchSet(ctx, req)
+	case protocol.CommandDelete:
+		s.trace("", "handler_entered", protocol.CommandDelete)
+		if resp, ok := s.checkWriteRouting(req.Key); !ok {
+			return resp
+		}
+		return s.dispatchDelete(ctx, req.Key)
+	case protocol.CommandGet:
+		s.trace("", "handler_entered", protocol.CommandGet)
+		if resp, ok := s.checkReadRouting(req.Key); !ok {
+			return resp
+		}
+		return s.dispatchGet(ctx, req.Key)
 	default:
 		return protocol.Response{
 			Kind:    protocol.ResponseError,
 			Message: protocol.ErrUnknownCommand.Error(),
 		}
 	}
+}
 
-	switch req.Command {
-	case protocol.CommandSet:
-		if err := s.store.Set(req.Key, req.Value, req.TTL); err != nil {
-			return protocol.Response{
-				Kind:    protocol.ResponseError,
-				Message: err.Error(),
-			}
+func (s *Server) dispatchSet(ctx context.Context, req protocol.Request) protocol.Response {
+	if s.cfg.Replication != nil && s.cfg.Replication.Enabled() {
+		if err := s.cfg.Replication.WriteSet(ctx, req.Key, req.Value, req.TTL); err != nil {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
 		}
 		return protocol.Response{Kind: protocol.ResponseOK}
-	case protocol.CommandGet:
-		value, ok := s.store.Get(req.Key)
+	}
+
+	if err := s.store.Set(req.Key, req.Value, req.TTL); err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseOK}
+}
+
+func (s *Server) dispatchDelete(ctx context.Context, key string) protocol.Response {
+	if s.cfg.Replication != nil && s.cfg.Replication.Enabled() {
+		deleted, err := s.cfg.Replication.WriteDelete(ctx, key)
+		if err != nil {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+		}
+		if !deleted {
+			return protocol.Response{Kind: protocol.ResponseNotFound}
+		}
+		return protocol.Response{Kind: protocol.ResponseOK}
+	}
+
+	if s.store.Delete(key) {
+		return protocol.Response{Kind: protocol.ResponseOK}
+	}
+	return protocol.Response{Kind: protocol.ResponseNotFound}
+}
+
+func (s *Server) dispatchGet(ctx context.Context, key string) protocol.Response {
+	if s.cfg.Replication != nil && s.cfg.Replication.Enabled() {
+		value, ok, err := s.cfg.Replication.Read(ctx, key)
+		if errors.Is(err, replication.ErrNotInReplicaSet) {
+			return s.redirectToPrimary(key)
+		}
+		if errors.Is(err, replication.ErrReadQuorumNotMet) {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+		}
+		if err != nil {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+		}
 		if !ok {
 			return protocol.Response{Kind: protocol.ResponseNotFound}
 		}
 		return protocol.Response{Kind: protocol.ResponseValue, Value: value}
-	case protocol.CommandDelete:
-		if s.store.Delete(req.Key) {
-			return protocol.Response{Kind: protocol.ResponseOK}
-		}
+	}
+
+	value, ok := s.store.Get(key)
+	if !ok {
 		return protocol.Response{Kind: protocol.ResponseNotFound}
-	default:
-		return protocol.Response{
-			Kind:    protocol.ResponseError,
-			Message: protocol.ErrUnknownCommand.Error(),
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: value}
+}
+
+func (s *Server) dispatchReplicaSet(req protocol.Request) protocol.Response {
+	if s.cfg.Replication == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "replication not enabled"}
+	}
+	if err := s.cfg.Replication.ApplyReplicaSet(req.Key, req.Value, req.TTL); err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseOK}
+}
+
+func (s *Server) dispatchReplicaGet(key string) protocol.Response {
+	if s.cfg.Replication == nil || !s.cfg.Replication.IsInReplicaSet(key) {
+		return protocol.Response{Kind: protocol.ResponseError, Message: replication.ErrNotInReplicaSet.Error()}
+	}
+	value, ok := s.store.Get(key)
+	if !ok {
+		return protocol.Response{Kind: protocol.ResponseNotFound}
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: value}
+}
+
+func (s *Server) dispatchReplicaDelete(key string) protocol.Response {
+	if s.cfg.Replication == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "replication not enabled"}
+	}
+	deleted, err := s.cfg.Replication.ApplyReplicaDelete(key)
+	if err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	if !deleted {
+		return protocol.Response{Kind: protocol.ResponseNotFound}
+	}
+	return protocol.Response{Kind: protocol.ResponseOK}
+}
+
+func (s *Server) checkWriteRouting(key string) (protocol.Response, bool) {
+	if s.cfg.Replication != nil && s.cfg.Replication.Enabled() {
+		if s.cfg.Replication.IsPrimary(key) {
+			return protocol.Response{}, true
 		}
+		return s.redirectToPrimary(key), false
+	}
+	return s.checkOwnership(key)
+}
+
+func (s *Server) checkReadRouting(key string) (protocol.Response, bool) {
+	if s.cfg.Replication != nil && s.cfg.Replication.Enabled() {
+		if s.cfg.Replication.IsInReplicaSet(key) {
+			return protocol.Response{}, true
+		}
+		return s.redirectToPrimary(key), false
+	}
+	return s.checkOwnership(key)
+}
+
+func (s *Server) redirectToPrimary(key string) protocol.Response {
+	if s.cfg.Cluster == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "cluster not enabled"}
+	}
+	primary, ok := s.cfg.Cluster.Owner(key)
+	if !ok {
+		return protocol.Response{Kind: protocol.ResponseError, Message: cluster.ErrEmptyRing.Error()}
+	}
+	return protocol.Response{
+		Kind:   protocol.ResponseMoved,
+		NodeID: primary.ID,
+		Addr:   primary.Addr,
 	}
 }
 
@@ -293,6 +461,23 @@ func (s *Server) dispatchClusterJoin(nodeID, addr string) protocol.Response {
 		}
 	}
 
+	if s.cfg.Raft != nil {
+		if !s.cfg.Raft.IsLeader() {
+			return s.raftNotLeaderResponse()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.cfg.Raft.Propose(ctx, raft.Command{
+			Type:   raft.CommandAddMember,
+			NodeID: nodeID,
+			Addr:   addr,
+		}); err != nil {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+		}
+		s.cfg.Logger.Info("cluster node joined via raft", "node_id", nodeID, "addr", addr)
+		return protocol.Response{Kind: protocol.ResponseOK}
+	}
+
 	if err := s.cfg.Cluster.Join(cluster.Node{ID: nodeID, Addr: addr}); err != nil {
 		return protocol.Response{
 			Kind:    protocol.ResponseError,
@@ -312,6 +497,22 @@ func (s *Server) dispatchClusterLeave(nodeID string) protocol.Response {
 		}
 	}
 
+	if s.cfg.Raft != nil {
+		if !s.cfg.Raft.IsLeader() {
+			return s.raftNotLeaderResponse()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.cfg.Raft.Propose(ctx, raft.Command{
+			Type:   raft.CommandRemoveMember,
+			NodeID: nodeID,
+		}); err != nil {
+			return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+		}
+		s.cfg.Logger.Info("cluster node left via raft", "node_id", nodeID)
+		return protocol.Response{Kind: protocol.ResponseOK}
+	}
+
 	if err := s.cfg.Cluster.Leave(nodeID); err != nil {
 		return protocol.Response{
 			Kind:    protocol.ResponseError,
@@ -321,6 +522,76 @@ func (s *Server) dispatchClusterLeave(nodeID string) protocol.Response {
 
 	s.cfg.Logger.Info("cluster node left", "node_id", nodeID)
 	return protocol.Response{Kind: protocol.ResponseOK}
+}
+
+func (s *Server) dispatchRaftRequestVote(payload []byte) protocol.Response {
+	if s.cfg.Raft == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "raft not enabled"}
+	}
+	var req raft.RequestVoteRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	resp := s.cfg.Raft.HandleRequestVote(req)
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: out}
+}
+
+func (s *Server) dispatchRaftAppendEntries(payload []byte) protocol.Response {
+	if s.cfg.Raft == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "raft not enabled"}
+	}
+	var req raft.AppendEntriesRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	s.trace("", "raft_handle_append_entries_enter", fmt.Sprintf("term=%d entries=%d", req.Term, len(req.Entries)))
+	resp := s.cfg.Raft.HandleAppendEntries(req)
+	s.trace("", "raft_handle_append_entries_exit", fmt.Sprintf("success=%v", resp.Success))
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: out}
+}
+
+func (s *Server) dispatchRaftStatus() protocol.Response {
+	if s.cfg.Raft == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "raft not enabled"}
+	}
+	status := s.cfg.Raft.Status()
+	out, err := json.Marshal(status)
+	if err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: out}
+}
+
+func (s *Server) dispatchMetrics() protocol.Response {
+	if s.cfg.Metrics == nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: "metrics not enabled"}
+	}
+	out, err := json.Marshal(s.cfg.Metrics.Snapshot())
+	if err != nil {
+		return protocol.Response{Kind: protocol.ResponseError, Message: err.Error()}
+	}
+	return protocol.Response{Kind: protocol.ResponseValue, Value: out}
+}
+
+func (s *Server) raftNotLeaderResponse() protocol.Response {
+	leaderID := s.cfg.Raft.LeaderID()
+	addr := s.cfg.Raft.LeaderAddr()
+	if leaderID == "" {
+		return protocol.Response{Kind: protocol.ResponseError, Message: raft.ErrNotLeader.Error()}
+	}
+	return protocol.Response{
+		Kind:   protocol.ResponseNotLeader,
+		NodeID: leaderID,
+		Addr:   addr,
+	}
 }
 
 func (s *Server) writeResponse(conn net.Conn, resp protocol.Response) error {

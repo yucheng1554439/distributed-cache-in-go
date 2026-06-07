@@ -1,0 +1,12 @@
+# Build artifacts
+*.exe
+node-test.exe
+loadtest-test.exe
+node-test
+loadtest-test
+
+# Benchmark raw output (regenerate with scripts/benchmark.ps1)
+benchmark-results/
+
+# Go
+/vendor/

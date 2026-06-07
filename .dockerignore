@@ -1,0 +1,14 @@
+# Build artifacts
+bin/
+*.exe
+
+# Git
+.git
+
+# IDE
+.idea
+.vscode
+
+# Tests and docs are copied only when needed; keep image lean.
+**/*_test.go
+tests/

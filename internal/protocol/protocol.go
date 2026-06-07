@@ -19,6 +19,14 @@ const (
 	CommandClusterMembers = "CLUSTER_MEMBERS"
 	CommandClusterJoin    = "CLUSTER_JOIN"
 	CommandClusterLeave   = "CLUSTER_LEAVE"
+	CommandReplSet        = "REPL_SET"
+	CommandReplDelete     = "REPL_DEL"
+	CommandReplGet        = "REPL_GET"
+	CommandPing           = "PING"
+	CommandMetrics        = "METRICS"
+	CommandRaftRequestVote   = "RAFT_REQUEST_VOTE"
+	CommandRaftAppendEntries = "RAFT_APPEND_ENTRIES"
+	CommandRaftStatus        = "RAFT_STATUS"
 )
 
 var (
@@ -45,6 +53,7 @@ const (
 	ResponseMoved
 	ResponseOwner
 	ResponseMembers
+	ResponseNotLeader
 )
 
 // Member describes a node in a cluster members response.
@@ -77,28 +86,29 @@ func EncodeRequest(req Request) ([]byte, error) {
 	if req.Command == "" {
 		return nil, fmt.Errorf("%w: empty command", ErrInvalidRequest)
 	}
-	if req.Key == "" && req.Command != CommandClusterMembers {
+	if req.Key == "" && req.Command != CommandClusterMembers && req.Command != CommandPing && req.Command != CommandMetrics && req.Command != CommandRaftStatus {
 		return nil, fmt.Errorf("%w: empty key", ErrInvalidRequest)
 	}
-	if req.Command == CommandSet && req.Value == nil {
+	if (req.Command == CommandSet || req.Command == CommandReplSet) && req.Value == nil {
 		return nil, fmt.Errorf("%w: SET requires value", ErrInvalidRequest)
 	}
-	if req.Command == CommandClusterJoin && req.Value == nil {
-		return nil, fmt.Errorf("%w: CLUSTER_JOIN requires value", ErrInvalidRequest)
+	if (req.Command == CommandClusterJoin || req.Command == CommandRaftRequestVote || req.Command == CommandRaftAppendEntries) && req.Value == nil {
+		return nil, fmt.Errorf("%w: command requires value", ErrInvalidRequest)
 	}
 
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "CMD %s\n", req.Command)
-	if req.Command != CommandClusterMembers {
+	if req.Command != CommandClusterMembers && req.Command != CommandPing && req.Command != CommandMetrics && req.Command != CommandRaftStatus {
 		fmt.Fprintf(&buf, "KEY %s\n", req.Key)
 	}
-	if req.Command == CommandSet || req.Command == CommandClusterJoin {
+	if req.Command == CommandSet || req.Command == CommandClusterJoin || req.Command == CommandReplSet ||
+		req.Command == CommandRaftRequestVote || req.Command == CommandRaftAppendEntries {
 		fmt.Fprintf(&buf, "VAL %d\n", len(req.Value))
 		if _, err := buf.Write(req.Value); err != nil {
 			return nil, err
 		}
 		buf.WriteByte('\n')
-		if req.Command == CommandSet && req.TTL > 0 {
+		if (req.Command == CommandSet || req.Command == CommandReplSet) && req.TTL > 0 {
 			seconds := int64(req.TTL / time.Second)
 			if seconds <= 0 {
 				seconds = 1
@@ -126,7 +136,7 @@ func DecodeRequest(r *bufio.Reader) (Request, error) {
 		return Request{}, fmt.Errorf("%w: empty command", ErrInvalidRequest)
 	}
 
-	if req.Command == CommandClusterMembers {
+	if req.Command == CommandClusterMembers || req.Command == CommandPing || req.Command == CommandMetrics || req.Command == CommandRaftStatus {
 		endLine, err := readLine(r)
 		if err != nil {
 			return Request{}, err
@@ -150,11 +160,11 @@ func DecodeRequest(r *bufio.Reader) (Request, error) {
 	}
 
 	switch req.Command {
-	case CommandSet:
+	case CommandSet, CommandReplSet:
 		return decodeSetRequest(r, req)
-	case CommandClusterJoin:
+	case CommandClusterJoin, CommandRaftRequestVote, CommandRaftAppendEntries:
 		return decodeValueRequest(r, req)
-	case CommandGet, CommandDelete, CommandOwner, CommandClusterLeave:
+	case CommandGet, CommandDelete, CommandOwner, CommandClusterLeave, CommandReplDelete, CommandReplGet:
 		endLine, err := readLine(r)
 		if err != nil {
 			return Request{}, err
@@ -263,6 +273,8 @@ func EncodeResponse(resp Response) ([]byte, error) {
 		for _, member := range resp.Members {
 			fmt.Fprintf(&buf, "%s %s\n", member.ID, member.Addr)
 		}
+	case ResponseNotLeader:
+		fmt.Fprintf(&buf, "NOT_LEADER %s %s\n", resp.NodeID, resp.Addr)
 	default:
 		return nil, fmt.Errorf("%w: unknown response kind", ErrInvalidRequest)
 	}
@@ -314,6 +326,11 @@ func DecodeResponse(r *bufio.Reader) (Response, error) {
 				return Response{}, fmt.Errorf("%w: invalid member line", ErrInvalidRequest)
 			}
 			resp.Members = append(resp.Members, Member{ID: id, Addr: addr})
+		}
+	case strings.HasPrefix(line, "NOT_LEADER "):
+		resp.Kind = ResponseNotLeader
+		if err := decodeNodeLine(line, "NOT_LEADER ", &resp.NodeID, &resp.Addr); err != nil {
+			return Response{}, err
 		}
 	case strings.HasPrefix(line, "VAL "):
 		resp.Kind = ResponseValue

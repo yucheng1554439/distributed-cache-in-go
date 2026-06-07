@@ -1,0 +1,92 @@
+name: distributed-cache
+
+services:
+  node-a:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    hostname: node-a
+    environment:
+      CACHE_NODE_ID: node-a
+      CACHE_ADVERTISE_ADDR: node-a:6379
+      CACHE_PEERS: node-b=node-b:6379,node-c=node-c:6379
+      CACHE_REPLICATION_FACTOR: "3"
+      CACHE_RAFT: "true"
+      CACHE_DEBUG_ADDR: ":6060"
+    command:
+      - -addr=:6379
+    ports:
+      - "6379:6379"
+      - "6060:6060"
+    networks:
+      - cache-net
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  node-b:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    hostname: node-b
+    environment:
+      CACHE_NODE_ID: node-b
+      CACHE_ADVERTISE_ADDR: node-b:6379
+      CACHE_PEERS: node-a=node-a:6379,node-c=node-c:6379
+      CACHE_REPLICATION_FACTOR: "3"
+      CACHE_RAFT: "true"
+      CACHE_DEBUG_ADDR: ":6060"
+    command:
+      - -addr=:6379
+    ports:
+      - "6380:6379"
+      - "6061:6060"
+    networks:
+      - cache-net
+    depends_on:
+      node-a:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  node-c:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    hostname: node-c
+    environment:
+      CACHE_NODE_ID: node-c
+      CACHE_ADVERTISE_ADDR: node-c:6379
+      CACHE_PEERS: node-a=node-a:6379,node-b=node-b:6379
+      CACHE_REPLICATION_FACTOR: "3"
+      CACHE_RAFT: "true"
+      CACHE_DEBUG_ADDR: ":6060"
+    command:
+      - -addr=:6379
+    ports:
+      - "6381:6379"
+      - "6062:6060"
+    networks:
+      - cache-net
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+networks:
+  cache-net:
+    driver: bridge
